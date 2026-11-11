@@ -20,7 +20,7 @@ jobs:
     # units x arm64-v8a + x86_64) is by far the longest pole, so a warm ccache
     # turns a full native compile into a near-noop.
     env:
-      ANDROID_USE_CCACHE: '1'
+      ANDROID_USE_CCACHE: '0'
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout with submodules
@@ -49,24 +49,6 @@ jobs:
       # the NDKs, AGP never downloads one on this project, and the archive is
       # ~2 GB — saving it alone cost ~7 minutes while restoring it merely
       # overwrote files that were already on disk.
-      - name: Install ccache
-        run: |
-          # ubuntu-latest does not ship ccache, so ANDROID_USE_CCACHE alone did
-          # nothing. Install it before CMake configures the native toolchain.
-          sudo apt-get install -y -qq ccache > /dev/null 2>&1 || {
-            sudo apt-get update -qq
-            sudo apt-get install -y -qq ccache
-          }
-          ccache --version | head -1
-
-      - name: Cache ccache (native build)
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.CCACHE_DIR }}
-          key: ccache-${{ runner.os }}-${{ hashFiles('llama-cpp/native/llama.cpp/**', 'llama-cpp/src/main/cpp/**', 'workspace/src/main/cpp/**') }}
-          restore-keys: |
-            ccache-${{ runner.os }}-
-
       # web/build.gradle.kts:installWebUiDeps downloads the web-ui dependency
       # tree with bun; the vite buildWebUi task depends on it.
       - name: Cache web-ui node_modules
