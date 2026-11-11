@@ -25,7 +25,7 @@ index edaf9fe..75122d1 100644
              tools.add(me.rerere.rikkahub.data.ai.tools.local.wakeScreenTool(context))
          }
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
-index 72c64c0..d291683 100644
+index 72c64c0..de1fb72 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
 @@ -8,6 +8,8 @@ import kotlinx.serialization.json.buildJsonArray
@@ -59,13 +59,24 @@ index 72c64c0..d291683 100644
          val (by, value, pkgFilter) = parseSelector(input)
          if (by == null || by !in ALLOWED_BY || value == null) {
              return@Tool listOf(
-@@ -189,6 +192,19 @@ fun findNodeTool(
+@@ -189,6 +192,30 @@ fun findNodeTool(
                  )
              )
          }
 +        if (rootContext != null && RootControl.enabled(rootContext)) {
 +            val tree = rootWindowTree(rootContext, 2000, true, pkgFilter)
-+            if (tree["error"] != null || tree["success"]?.jsonPrimitive?.booleanOrNull != true) return@Tool listOf(UIMessagePart.Text(tree.toString()))
++            if (tree["error"] != null || tree["success"]?.jsonPrimitive?.booleanOrNull != true) {
++                val capture = captureRootScreenshot(rootContext, false)
++                val parts = mutableListOf<UIMessagePart>()
++                capture["file_path"]?.jsonPrimitive?.contentOrNull?.let { parts.add(UIMessagePart.Image(url = "file://$it")) }
++                parts.add(UIMessagePart.Text(buildJsonObject {
++                    put("error", "root_window_tree_unavailable")
++                    put("tree_error", tree)
++                    put("screenshot", capture)
++                    put("note", "No node matches were returned. If screenshot succeeded and your model supports vision, inspect the image and use tap after scaling coordinates to the display size. Do not repeatedly retry the tree.")
++                }.toString()))
++                return@Tool parts
++            }
 +            val key = if (by == "view_id_resource_name") "view_id" else by
 +            val matches = tree["nodes"]!!.jsonArray.map { it.jsonObject }.filter { it[key]?.jsonPrimitive?.contentOrNull == value }
 +            val result = buildJsonObject {
@@ -201,10 +212,10 @@ index 0000000..367cc2b
 +}
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt
 new file mode 100644
-index 0000000..7a73841
+index 0000000..313a2d1
 --- /dev/null
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt
-@@ -0,0 +1,71 @@
+@@ -0,0 +1,80 @@
 +package me.rerere.rikkahub.data.ai.tools.local
 +
 +import android.content.Context
@@ -214,12 +225,21 @@ index 0000000..7a73841
 +import kotlinx.serialization.json.*
 +import org.xmlpull.v1.XmlPullParser
 +import java.io.File
++import java.util.UUID
 +
 +/** A fresh UIAutomator dump; coordinates are snapshots and are not accessibility node handles. */
 +internal suspend fun rootWindowTree(context: Context, maxNodes: Int, verbose: Boolean, packageFilter: String?): JsonObject = withContext(Dispatchers.IO) {
 +    val file = File.createTempFile("root-window-", ".xml", context.cacheDir)
 +    try {
-+        val result = RootControl.execute(context, "uiautomator dump ${RootControl.quote(file.absolutePath)}")
++        // UIAutomator needs the shell SELinux domain on SKroot devices. The shell domain
++        // cannot necessarily access app-private cache, so use a unique intermediate path and
++        // copy through the original root shell into the app-owned file. Always remove the dump.
++        val dumpPath = "/data/local/tmp/rikkahub-ui-${UUID.randomUUID()}.xml"
++        val quotedDump = RootControl.quote(dumpPath)
++        val quotedOutput = RootControl.quote(file.absolutePath)
++        val command = "trap 'rm -f $quotedDump' EXIT; " +
++            "runcon u:r:shell:s0 uiautomator dump $quotedDump && cat $quotedDump > $quotedOutput"
++        val result = RootControl.execute(context, command)
 +        if (result["success"]?.jsonPrimitive?.booleanOrNull != true) return@withContext result
 +        if (file.length() <= 0 || file.length() > 4L * 1024 * 1024) return@withContext buildJsonObject {
 +            put("error", "window_dump_unavailable"); put("reason", "empty_or_oversized_dump")
@@ -263,7 +283,7 @@ index 0000000..7a73841
 +        }
 +        }
 +        if (seen == 0) return@withContext buildJsonObject { put("error", "window_dump_unavailable"); put("reason", "no_nodes") }
-+        if (packageFilter != null && packageFilter != pkg) return@withContext buildJsonObject {
++        if (!packageFilter.isNullOrBlank() && packageFilter != pkg) return@withContext buildJsonObject {
 +            put("error", "wrong_foreground_app"); put("current", pkg); put("nodes", buildJsonArray {})
 +        }
 +        buildJsonObject {
@@ -277,7 +297,7 @@ index 0000000..7a73841
 +    } finally { file.delete() }
 +}
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
-index 1dac9b5..6e8cd40 100644
+index 1dac9b5..8dac7b3 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
 @@ -3,6 +3,9 @@ package me.rerere.rikkahub.data.ai.tools.local
@@ -341,7 +361,7 @@ index 1dac9b5..6e8cd40 100644
      }
  }
  
-+private suspend fun captureRootScreenshot(context: Context, keep: Boolean): JsonObject = withContext(Dispatchers.IO) {
++internal suspend fun captureRootScreenshot(context: Context, keep: Boolean): JsonObject = withContext(Dispatchers.IO) {
 +    val dir = File(context.cacheDir, SCREENSHOT_CACHE_DIR).apply { mkdirs() }
 +    pruneOldCacheScreenshots(dir)
 +    val tmp = File.createTempFile("root-capture-", ".png", dir)
@@ -484,7 +504,7 @@ index bf6e565..941dd34 100644
              withActionEnvelope(svc) { _ ->
                  val dm = svc.resources.displayMetrics
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
-index a580fe9..f387ee3 100644
+index a580fe9..c8ca2d7 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
 @@ -106,9 +106,10 @@ private fun android.view.accessibility.AccessibilityWindowInfo.getDisplayIdCompa
@@ -508,7 +528,7 @@ index a580fe9..f387ee3 100644
          val verbose = input.jsonObject["verbose"]?.jsonPrimitive?.booleanOrNull ?: false
          val maxNodesRaw = input.jsonObject["max_nodes"]?.jsonPrimitive?.intOrNull ?: DEFAULT_MAX_NODES
          val maxNodes = maxNodesRaw.coerceIn(1, MAX_NODES_HARD_CEILING)
-@@ -149,6 +150,12 @@ fun readWindowTreeTool(
+@@ -149,6 +150,24 @@ fun readWindowTreeTool(
          val diff = input.jsonObject["diff"]?.jsonPrimitive?.booleanOrNull ?: false
          val displayId = input.jsonObject["display_id"]?.jsonPrimitive?.intOrNull ?: 0
  
@@ -516,6 +536,18 @@ index a580fe9..f387ee3 100644
 +            if (displayId != 0) return@Tool listOf(UIMessagePart.Text(buildJsonObject { put("error", "root_display_unsupported") }.toString()))
 +            val tree = rootWindowTree(rootContext, maxNodes, verbose, pkgFilter)
 +            streamer.streamIfHeadless(invocationContext, "ReadWindowTree")
++            if (tree["error"] != null || tree["success"]?.jsonPrimitive?.booleanOrNull == false) {
++                val capture = captureRootScreenshot(rootContext, false)
++                val parts = mutableListOf<UIMessagePart>()
++                capture["file_path"]?.jsonPrimitive?.contentOrNull?.let { parts.add(UIMessagePart.Image(url = "file://$it")) }
++                parts.add(UIMessagePart.Text(buildJsonObject {
++                    put("error", "root_window_tree_unavailable")
++                    put("tree_error", tree)
++                    put("screenshot", capture)
++                    put("note", "No node tree was returned. If the screenshot succeeded and your model supports vision, inspect it and use tap/swipe. Scale image coordinates to display_width and display_height. Do not repeatedly retry the tree.")
++                }.toString()))
++                return@Tool parts
++            }
 +            return@Tool listOf(UIMessagePart.Text(tree.toString()))
 +        }
          val payload = AccessibilityServiceHandle.withService { svc ->
