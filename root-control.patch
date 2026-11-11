@@ -1,0 +1,319 @@
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+index edaf9fe..e9b96c7 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
+@@ -925,15 +925,15 @@ class LocalTools(
+             tools.add(me.rerere.rikkahub.data.ai.tools.local.getJobHistoryTool(scheduledJobRepository, scheduledJobRunRepository))
+         }
+         if (options.contains(LocalToolOption.ScreenAutomation)) {
+-            tools.add(tapTool(invocationContext, interactiveToolStreamer))
+-            tools.add(longPressTool(invocationContext, interactiveToolStreamer))
+-            tools.add(swipeTool(invocationContext, interactiveToolStreamer))
++            tools.add(tapTool(invocationContext, interactiveToolStreamer, context))
++            tools.add(longPressTool(invocationContext, interactiveToolStreamer, context))
++            tools.add(swipeTool(invocationContext, interactiveToolStreamer, context))
+             tools.add(readWindowTreeTool(invocationContext, interactiveToolStreamer))
+             tools.add(findNodeTool(invocationContext, interactiveToolStreamer))
+             tools.add(clickNodeTool(invocationContext, interactiveToolStreamer))
+             tools.add(me.rerere.rikkahub.data.ai.tools.local.setTextTool(invocationContext, interactiveToolStreamer))
+             tools.add(scrollTool(invocationContext, interactiveToolStreamer))
+-            tools.add(globalActionTool(invocationContext, interactiveToolStreamer))
++            tools.add(globalActionTool(invocationContext, interactiveToolStreamer, context))
+             tools.add(takeScreenshotTool(context))  // take_screenshot IS the screenshot; skip auto-stream
+             tools.add(me.rerere.rikkahub.data.ai.tools.local.wakeScreenTool(context))
+         }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt
+index fcd3947..0c24cf7 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt
+@@ -28,6 +28,7 @@ private val ACTION_MAP: Map<String, Int> = mapOf(
+ fun globalActionTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "global_action",
+     description = """
+@@ -35,7 +36,7 @@ fun globalActionTool(
+         lock_screen / power_dialog. success only means the OS accepted the action; verify the
+         outcome via the returned "after" object (e.g. after home, confirm shade_open is absent
+         and the launcher package is foreground before assuming you are on the home screen).
+-    """.trimIndent().replace("\n", " "),
++    """.trimIndent().replace("\n", " ") + " In root input mode the after object is unavailable.",
+     parameters = {
+         InputSchema.Obj(
+             properties = buildJsonObject {
+@@ -50,8 +51,9 @@ fun globalActionTool(
+     },
+     execute = { input ->
+         AgentTurnTracker.recordAutomationAction()
+-        val wakeOk = me.rerere.rikkahub.service.RikkaAccessibilityService.instance
+-            ?.let { wakeScreenIfNeeded(it) } ?: true
++        val wakeOk = if (rootContext != null && RootControl.enabled(rootContext)) true else
++            me.rerere.rikkahub.service.RikkaAccessibilityService.instance
++                ?.let { wakeScreenIfNeeded(it) } ?: true
+         val action = input.jsonObject["action"]?.jsonPrimitive?.contentOrNull
+         val code = action?.let { ACTION_MAP[it] }
+         if (action == null || code == null) {
+@@ -63,6 +65,15 @@ fun globalActionTool(
+                 )
+             )
+         }
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            val key = mapOf("back" to 4, "home" to 3, "recents" to 187, "lock_screen" to 223)[action]
++            if (key == null) return@Tool listOf(UIMessagePart.Text(buildJsonObject {
++                put("success", false); put("error", "unsupported_root_action"); put("action", action)
++            }.toString()))
++            val result = RootControl.execute(rootContext, "input keyevent $key")
++            streamer.streamIfHeadless(invocationContext, "GlobalAction $action")
++            return@Tool listOf(UIMessagePart.Text(result.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             withActionEnvelope(svc) { _ ->
+                 val ok = svc.performGlobalAction(code)
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt
+new file mode 100644
+index 0000000..694db7f
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt
+@@ -0,0 +1,63 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import android.content.Context
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.json.JsonObject
++import kotlinx.serialization.json.buildJsonObject
++import kotlinx.serialization.json.put
++import java.util.concurrent.TimeUnit
++
++/** Explicitly selected root input backend. Never falls back to accessibility on failure. */
++object RootControl {
++    const val DEFAULT_SU = "/data/PmbIWbsgEnHpoJyT/su"
++    private fun prefs(context: Context) = context.getSharedPreferences("root_control", Context.MODE_PRIVATE)
++    fun enabled(context: Context) = prefs(context).getBoolean("enabled", false)
++    fun setEnabled(context: Context, enabled: Boolean) { prefs(context).edit().putBoolean("enabled", enabled).apply() }
++    fun suPath(context: Context) = prefs(context).getString("su_path", DEFAULT_SU) ?: DEFAULT_SU
++    fun setSuPath(context: Context, path: String) { prefs(context).edit().putString("su_path", path.trim()).apply() }
++
++    suspend fun execute(context: Context, command: String): JsonObject = withContext(Dispatchers.IO) {
++        var process: Process? = null
++        try {
++            val path = suPath(context)
++            if (!path.startsWith("/") || path.contains('\n') || path.contains('\u0000')) {
++                return@withContext buildJsonObject { put("success", false); put("error", "invalid_su_path") }
++            }
++            val running = ProcessBuilder(path, "-c", "test \"$(id -u)\" = 0 && $command").redirectErrorStream(true).start()
++            process = running
++            // Drain command output to prevent a full pipe from blocking the process.
++            val output = StringBuilder()
++            val reader = Thread {
++                running.inputStream.bufferedReader().useLines { lines ->
++                    lines.forEach { line -> if (output.length < 2048) output.append(line.take(2048)).append('\n') }
++                }
++            }
++            reader.isDaemon = true
++            reader.start()
++            if (!running.waitFor(20, TimeUnit.SECONDS)) {
++                running.destroyForcibly()
++                return@withContext buildJsonObject { put("success", false); put("error", "root_timeout_or_permission_pending") }
++            }
++            reader.join(1000)
++            val code = running.exitValue()
++            buildJsonObject {
++                put("success", code == 0)
++                put("backend", "root")
++                put("exit_code", code)
++                if (code != 0) { put("error", "root_command_failed"); put("detail", output.toString().take(2048)) }
++                put("note", "Command exit status does not confirm the UI changed; screen state is unavailable in root input mode.")
++            }
++        } catch (e: Exception) {
++            buildJsonObject { put("success", false); put("error", "root_start_failed"); put("detail", e.message ?: e.javaClass.simpleName) }
++        } finally { process?.destroy() }
++    }
++
++    suspend fun input(context: Context, points: List<Pair<Double, Double>>, command: String): JsonObject {
++        val dm = context.resources.displayMetrics
++        if (points.any { coordsOutOfBounds(it.first, it.second, dm.widthPixels, dm.heightPixels) }) {
++            return buildJsonObject { put("error", "out_of_bounds"); put("display", buildJsonObject { put("w", dm.widthPixels); put("h", dm.heightPixels) }) }
++        }
++        return execute(context, command)
++    }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
+index f064f2e..18c3a14 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
+@@ -22,6 +22,7 @@ private fun numOrNull(input: kotlinx.serialization.json.JsonElement, key: String
+ fun swipeTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "swipe",
+     description = """
+@@ -30,7 +31,7 @@ fun swipeTool(
+         the standard service-not-active envelope. The result carries an "after" object
+         (foreground surface, shade_open, screen_changed); check it to verify the swipe did
+         what you intended before acting again.
+-    """.trimIndent().replace("\n", " "),
++    """.trimIndent().replace("\n", " ") + " In root input mode the after object is unavailable.",
+     parameters = {
+         InputSchema.Obj(
+             properties = buildJsonObject {
+@@ -48,8 +49,9 @@ fun swipeTool(
+     },
+     execute = { input ->
+         AgentTurnTracker.recordAutomationAction()
+-        val wakeOk = me.rerere.rikkahub.service.RikkaAccessibilityService.instance
+-            ?.let { wakeScreenIfNeeded(it) } ?: true
++        val wakeOk = if (rootContext != null && RootControl.enabled(rootContext)) true else
++            me.rerere.rikkahub.service.RikkaAccessibilityService.instance
++                ?.let { wakeScreenIfNeeded(it) } ?: true
+         val sx = numOrNull(input, "start_x")
+         val sy = numOrNull(input, "start_y")
+         val ex = numOrNull(input, "end_x")
+@@ -73,6 +75,11 @@ fun swipeTool(
+                 )
+             )
+         }
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            val result = RootControl.input(rootContext, listOf(sx to sy, ex to ey), "input swipe ${sx.toInt()} ${sy.toInt()} ${ex.toInt()} ${ey.toInt()} $duration")
++            streamer.streamIfHeadless(invocationContext, "Swipe (${sx.toInt()},${sy.toInt()})->(${ex.toInt()},${ey.toInt()}) ${duration}ms")
++            return@Tool listOf(UIMessagePart.Text(result.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             withActionEnvelope(svc) { _ ->
+                 val dm = svc.resources.displayMetrics
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
+index bf6e565..941dd34 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/TapTool.kt
+@@ -24,11 +24,12 @@ private fun coordOrError(jsonObj: kotlinx.serialization.json.JsonElement, key: S
+ fun tapTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "tap",
+     description = """
+-        Tap at absolute screen coordinates (pixels). Requires the AccessibilityService to be
+-        enabled. The result carries an "after" object: foreground package/window, shade_open,
++        Tap at absolute screen coordinates (pixels). Uses the selected accessibility or root input backend.
++        Root mode does not provide an after object; use other observation tools where available. The result carries an "after" object: foreground package/window, shade_open,
+         ime_visible, display size, and screen_changed telling you whether the tap actually
+         changed the UI. Read it before deciding your next action instead of taking a screenshot.
+         Coordinates outside the display are rejected with the display size. Prefer click_node
+@@ -52,8 +53,9 @@ fun tapTool(
+     execute = { input ->
+         AgentTurnTracker.recordAutomationAction()
+         // Wake screen so gestures land on a visible surface, not a dark screen.
+-        val wakeOk = me.rerere.rikkahub.service.RikkaAccessibilityService.instance
+-            ?.let { wakeScreenIfNeeded(it) } ?: true
++        val wakeOk = if (rootContext != null && RootControl.enabled(rootContext)) true else
++            me.rerere.rikkahub.service.RikkaAccessibilityService.instance
++                ?.let { wakeScreenIfNeeded(it) } ?: true
+         val x = coordOrError(input, "x")
+         val y = coordOrError(input, "y")
+         if (x == null || y == null) {
+@@ -65,6 +67,11 @@ fun tapTool(
+                 )
+             )
+         }
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            val result = RootControl.input(rootContext, listOf(x to y), "input tap ${x.toInt()} ${y.toInt()}")
++            streamer.streamIfHeadless(invocationContext, "Tap (${x.toInt()}, ${y.toInt()})")
++            return@Tool listOf(UIMessagePart.Text(result.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             withActionEnvelope(svc) { _ ->
+                 val dm = svc.resources.displayMetrics
+@@ -105,6 +112,7 @@ fun tapTool(
+ fun longPressTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "long_press",
+     description = """
+@@ -133,8 +141,9 @@ fun longPressTool(
+     },
+     execute = { input ->
+         AgentTurnTracker.recordAutomationAction()
+-        val wakeOk = me.rerere.rikkahub.service.RikkaAccessibilityService.instance
+-            ?.let { wakeScreenIfNeeded(it) } ?: true
++        val wakeOk = if (rootContext != null && RootControl.enabled(rootContext)) true else
++            me.rerere.rikkahub.service.RikkaAccessibilityService.instance
++                ?.let { wakeScreenIfNeeded(it) } ?: true
+         val x = coordOrError(input, "x")
+         val y = coordOrError(input, "y")
+         if (x == null || y == null) {
+@@ -157,6 +166,11 @@ fun longPressTool(
+                 )
+             )
+         }
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            val result = RootControl.input(rootContext, listOf(x to y), "input swipe ${x.toInt()} ${y.toInt()} ${x.toInt()} ${y.toInt()} $durationRaw")
++            streamer.streamIfHeadless(invocationContext, "LongPress (${x.toInt()}, ${y.toInt()}) ${durationRaw}ms")
++            return@Tool listOf(UIMessagePart.Text(result.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             withActionEnvelope(svc) { _ ->
+                 val dm = svc.resources.displayMetrics
+diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
+index 4a06cca..b99193b 100644
+--- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
++++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
+@@ -15,6 +15,9 @@ import androidx.compose.material3.LargeFlexibleTopAppBar
+ import androidx.compose.material3.MaterialTheme
+ import androidx.compose.material3.Scaffold
+ import androidx.compose.material3.Text
++import androidx.compose.material3.Switch
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Button
+ import androidx.compose.material3.TopAppBarDefaults
+ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.LaunchedEffect
+@@ -40,6 +43,7 @@ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.launch
+ import me.rerere.rikkahub.R
+ import me.rerere.rikkahub.data.ai.tools.local.AccessibilityServiceHandle
++import me.rerere.rikkahub.data.ai.tools.local.RootControl
+ import me.rerere.rikkahub.data.ai.tools.local.PermissionHelper
+ import me.rerere.rikkahub.data.permissions.KeepAliveVendor
+ import me.rerere.rikkahub.data.permissions.keepAliveVendorOf
+@@ -67,6 +71,9 @@ fun SettingAccessibilityPage() {
+     val context = LocalContext.current
+     val toaster = LocalToaster.current
+     val scope = rememberCoroutineScope()
++    var rootEnabled by remember { mutableStateOf(RootControl.enabled(context)) }
++    var suPath by remember { mutableStateOf(RootControl.suPath(context)) }
++    var rootTestResult by remember { mutableStateOf("") }
+     val scrollBehavior = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+ 
+     // The live service singleton is absent for a moment after every process restart, and a
+@@ -173,6 +180,24 @@ fun SettingAccessibilityPage() {
+                 .verticalScroll(rememberScrollState()),
+             verticalArrangement = Arrangement.spacedBy(12.dp)
+         ) {
++            Text("Root 控制模式", style = MaterialTheme.typography.titleSmall)
++            androidx.compose.foundation.layout.Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
++                Switch(checked = rootEnabled, onCheckedChange = {
++                    rootEnabled = it
++                    RootControl.setEnabled(context, it)
++                })
++                Text(if (rootEnabled) "  已启用 Root 输入" else "  使用无障碍输入")
++            }
++            OutlinedTextField(value = suPath, onValueChange = {
++                suPath = it
++                RootControl.setSuPath(context, it)
++            }, label = { Text("su 可执行文件路径") }, singleLine = true)
++            Button(onClick = { scope.launch {
++                val result = RootControl.execute(context, "test \"$(id -u)\" = 0")
++                rootTestResult = result.toString()
++            } }) { Text("测试 Root 授权") }
++            if (rootTestResult.isNotEmpty()) Text(rootTestResult)
++            Text("Root 模式支持点击、长按、滑动和部分系统按键。截图、界面节点和其他操作仍可能需要无障碍；失败不会自动切换。")
+             // Status card
+             Text(
+                 text = stringResource(R.string.setting_page_accessibility_status_section),
