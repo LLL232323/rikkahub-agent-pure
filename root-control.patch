@@ -1,5 +1,5 @@
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
-index edaf9fe..e9b96c7 100644
+index edaf9fe..75122d1 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/LocalTools.kt
 @@ -925,15 +925,15 @@ class LocalTools(
@@ -9,11 +9,13 @@ index edaf9fe..e9b96c7 100644
 -            tools.add(tapTool(invocationContext, interactiveToolStreamer))
 -            tools.add(longPressTool(invocationContext, interactiveToolStreamer))
 -            tools.add(swipeTool(invocationContext, interactiveToolStreamer))
+-            tools.add(readWindowTreeTool(invocationContext, interactiveToolStreamer))
+-            tools.add(findNodeTool(invocationContext, interactiveToolStreamer))
 +            tools.add(tapTool(invocationContext, interactiveToolStreamer, context))
 +            tools.add(longPressTool(invocationContext, interactiveToolStreamer, context))
 +            tools.add(swipeTool(invocationContext, interactiveToolStreamer, context))
-             tools.add(readWindowTreeTool(invocationContext, interactiveToolStreamer))
-             tools.add(findNodeTool(invocationContext, interactiveToolStreamer))
++            tools.add(readWindowTreeTool(invocationContext, interactiveToolStreamer, context))
++            tools.add(findNodeTool(invocationContext, interactiveToolStreamer, context))
              tools.add(clickNodeTool(invocationContext, interactiveToolStreamer))
              tools.add(me.rerere.rikkahub.data.ai.tools.local.setTextTool(invocationContext, interactiveToolStreamer))
              tools.add(scrollTool(invocationContext, interactiveToolStreamer))
@@ -22,6 +24,61 @@ index edaf9fe..e9b96c7 100644
              tools.add(takeScreenshotTool(context))  // take_screenshot IS the screenshot; skip auto-stream
              tools.add(me.rerere.rikkahub.data.ai.tools.local.wakeScreenTool(context))
          }
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
+index 72c64c0..d291683 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/FindNodeTool.kt
+@@ -8,6 +8,8 @@ import kotlinx.serialization.json.buildJsonArray
+ import kotlinx.serialization.json.buildJsonObject
+ import kotlinx.serialization.json.contentOrNull
+ import kotlinx.serialization.json.intOrNull
++import kotlinx.serialization.json.jsonArray
++import kotlinx.serialization.json.booleanOrNull
+ import kotlinx.serialization.json.jsonObject
+ import kotlinx.serialization.json.jsonPrimitive
+ import kotlinx.serialization.json.put
+@@ -147,10 +149,11 @@ private fun suggestAlternativesJson(
+ fun findNodeTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "find_node",
+     description = """
+-        Find accessibility nodes in the active window matching a selector. by: text |
++        Find nodes in the active window matching a selector. Root results have center coordinates but no node_id; use tap. by: text |
+         content_description | view_id_resource_name. Returns {matches: [...]} with at most 50
+         node summaries. Use read_window_tree first to see what's available, then this for
+         targeted lookups. Matching runs over the same traversal as read_window_tree, so
+@@ -178,7 +181,7 @@ fun findNodeTool(
+         )
+     },
+     execute = { input ->
+-        me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
++        if (rootContext == null || !RootControl.enabled(rootContext)) me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val (by, value, pkgFilter) = parseSelector(input)
+         if (by == null || by !in ALLOWED_BY || value == null) {
+             return@Tool listOf(
+@@ -189,6 +192,19 @@ fun findNodeTool(
+                 )
+             )
+         }
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            val tree = rootWindowTree(rootContext, 2000, true, pkgFilter)
++            if (tree["error"] != null || tree["success"]?.jsonPrimitive?.booleanOrNull != true) return@Tool listOf(UIMessagePart.Text(tree.toString()))
++            val key = if (by == "view_id_resource_name") "view_id" else by
++            val matches = tree["nodes"]!!.jsonArray.map { it.jsonObject }.filter { it[key]?.jsonPrimitive?.contentOrNull == value }
++            val result = buildJsonObject {
++                put("backend", "root_uiautomator"); put("matches", buildJsonArray { matches.take(50).forEach { add(it) } })
++                put("truncated", matches.size > 50 || tree["truncated"]?.jsonPrimitive?.booleanOrNull == true)
++                put("note", "Use tap with the center coordinates; re-read before tapping. Node IDs are unavailable.")
++            }
++            streamer.streamIfHeadless(invocationContext, "FindNode")
++            return@Tool listOf(UIMessagePart.Text(result.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             val root = svc.rootInActiveWindow
+             if (root == null) {
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt
 index fcd3947..0c24cf7 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/GlobalActionTool.kt
@@ -73,10 +130,10 @@ index fcd3947..0c24cf7 100644
                  val ok = svc.performGlobalAction(code)
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt
 new file mode 100644
-index 0000000..694db7f
+index 0000000..367cc2b
 --- /dev/null
 +++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootControl.kt
-@@ -0,0 +1,63 @@
+@@ -0,0 +1,65 @@
 +package me.rerere.rikkahub.data.ai.tools.local
 +
 +import android.content.Context
@@ -95,6 +152,8 @@ index 0000000..694db7f
 +    fun setEnabled(context: Context, enabled: Boolean) { prefs(context).edit().putBoolean("enabled", enabled).apply() }
 +    fun suPath(context: Context) = prefs(context).getString("su_path", DEFAULT_SU) ?: DEFAULT_SU
 +    fun setSuPath(context: Context, path: String) { prefs(context).edit().putString("su_path", path.trim()).apply() }
++
++    fun quote(value: String): String = "'" + value.replace("'", "'\\''") + "'"
 +
 +    suspend fun execute(context: Context, command: String): JsonObject = withContext(Dispatchers.IO) {
 +        var process: Process? = null
@@ -140,6 +199,170 @@ index 0000000..694db7f
 +        return execute(context, command)
 +    }
 +}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt
+new file mode 100644
+index 0000000..7a73841
+--- /dev/null
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/RootWindowTree.kt
+@@ -0,0 +1,71 @@
++package me.rerere.rikkahub.data.ai.tools.local
++
++import android.content.Context
++import android.util.Xml
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
++import kotlinx.serialization.json.*
++import org.xmlpull.v1.XmlPullParser
++import java.io.File
++
++/** A fresh UIAutomator dump; coordinates are snapshots and are not accessibility node handles. */
++internal suspend fun rootWindowTree(context: Context, maxNodes: Int, verbose: Boolean, packageFilter: String?): JsonObject = withContext(Dispatchers.IO) {
++    val file = File.createTempFile("root-window-", ".xml", context.cacheDir)
++    try {
++        val result = RootControl.execute(context, "uiautomator dump ${RootControl.quote(file.absolutePath)}")
++        if (result["success"]?.jsonPrimitive?.booleanOrNull != true) return@withContext result
++        if (file.length() <= 0 || file.length() > 4L * 1024 * 1024) return@withContext buildJsonObject {
++            put("error", "window_dump_unavailable"); put("reason", "empty_or_oversized_dump")
++        }
++        val nodes = mutableListOf<JsonObject>()
++        var pkg = ""
++        var seen = 0
++        var truncated = false
++        val parser = Xml.newPullParser()
++        file.inputStream().bufferedReader().use { reader ->
++        parser.setInput(reader)
++        var event = parser.eventType
++        while (event != XmlPullParser.END_DOCUMENT) {
++            if (event == XmlPullParser.START_TAG && parser.name == "node") {
++                seen++
++                fun attr(name: String) = parser.getAttributeValue(null, name).orEmpty()
++                if (pkg.isEmpty()) pkg = attr("package")
++                val text = if (attr("password") == "true") "" else attr("text")
++                val desc = attr("content-desc")
++                val clickable = attr("clickable") == "true"
++                val scrollable = attr("scrollable") == "true"
++                val bounds = Regex("\\[(\\d+),(\\d+)\\]\\[(\\d+),(\\d+)\\]").matchEntire(attr("bounds"))
++                if (bounds != null && (verbose || clickable || scrollable || text.isNotEmpty() || desc.isNotEmpty())) {
++                    if (nodes.size < maxNodes) {
++                        val b = bounds.groupValues.drop(1).map { it.toInt() }
++                        nodes.add(buildJsonObject {
++                            put("bounds", buildJsonArray { b.forEach { add(it) } })
++                            put("center", buildJsonArray { add((b[0] + b[2]) / 2); add((b[1] + b[3]) / 2) })
++                            attr("class").takeIf { it.isNotEmpty() }?.let { put("class", it) }
++                            text.takeIf { it.isNotEmpty() }?.let { put("text", it) }
++                            desc.takeIf { it.isNotEmpty() }?.let { put("content_description", it) }
++                            attr("resource-id").takeIf { it.isNotEmpty() }?.let { put("view_id", it) }
++                            if (clickable) put("clickable", true)
++                            if (scrollable) put("scrollable", true)
++                            if (attr("enabled") == "false") put("enabled", false)
++                        })
++                    } else truncated = true
++                }
++            }
++            event = parser.next()
++        }
++        }
++        if (seen == 0) return@withContext buildJsonObject { put("error", "window_dump_unavailable"); put("reason", "no_nodes") }
++        if (packageFilter != null && packageFilter != pkg) return@withContext buildJsonObject {
++            put("error", "wrong_foreground_app"); put("current", pkg); put("nodes", buildJsonArray {})
++        }
++        buildJsonObject {
++            put("success", true); put("backend", "root_uiautomator"); put("package", pkg)
++            put("total_seen", seen); put("truncated", truncated)
++            put("nodes", buildJsonArray { nodes.forEach { add(it) } })
++            put("note", "Snapshot coordinates only, no node_id. Re-read before using tap at center. UIAutomator depends on Android accessibility internals; this app's accessibility service need not be enabled. No diff or screen_state.")
++        }
++    } catch (e: Exception) {
++        buildJsonObject { put("error", "window_dump_unavailable"); put("reason", e.message ?: "parse_failed") }
++    } finally { file.delete() }
++}
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
+index 1dac9b5..6e8cd40 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/ScreenshotTool.kt
+@@ -3,6 +3,9 @@ package me.rerere.rikkahub.data.ai.tools.local
+ import android.content.ContentValues
+ import android.content.Context
+ import android.graphics.Bitmap
++import android.graphics.BitmapFactory
++import kotlinx.coroutines.Dispatchers
++import kotlinx.coroutines.withContext
+ import android.net.Uri
+ import android.os.Build
+ import android.os.Environment
+@@ -65,7 +68,7 @@ private fun pruneOldCacheScreenshots(dir: File) {
+ 
+ fun takeScreenshotTool(context: Context): Tool = Tool(
+     name = "take_screenshot",
+-    description = "Capture the current display via AccessibilityService and return it as a vision attachment. The image is downscaled for the model. By default the screenshot is a transient working copy: it is deleted when this turn ends, so pass keep=true when the user wants the picture saved — that also writes a full-resolution copy to Pictures/RikkaHub/Screenshots/ and fills gallery_path. Secure surfaces (banking, DRM, password fields) error gracefully. OS-rate-limited to ~1/sec. The result includes screen_state (foreground package, shade_open, display size). For \"did my action work\" checks prefer the \"after\" object that action tools already return; screenshot only when you need visual detail.",
++    description = "Capture the current display using the selected Root or Accessibility backend and return it as a vision attachment. Root supports only the default display; protected content may be blank. The image is downscaled for the model. By default the screenshot is a transient working copy: it is deleted when this turn ends, so pass keep=true when the user wants the picture saved — that also writes a full-resolution copy to Pictures/RikkaHub/Screenshots/ and fills gallery_path. Secure surfaces (banking, DRM, password fields) error gracefully. OS-rate-limited to ~1/sec. The result includes screen_state (foreground package, shade_open, display size). For \"did my action work\" checks prefer the \"after\" object that action tools already return; screenshot only when you need visual detail.",
+     parameters = {
+         InputSchema.Obj(
+             properties = buildJsonObject {
+@@ -90,7 +93,11 @@ fun takeScreenshotTool(context: Context): Tool = Tool(
+         // ImageReader that backs the display's Surface instead.
+         val isVirtualDisplay = displayId != 0 && VirtualDisplayController.contains(displayId)
+ 
+-        val outcome = if (isVirtualDisplay) {
++        val outcome = if (RootControl.enabled(context) && displayId != 0) {
++            buildJsonObject { put("error", "root_display_unsupported"); put("reason", "Root screenshot currently supports the default display only.") }
++        } else if (RootControl.enabled(context)) {
++            captureRootScreenshot(context, keep)
++        } else if (isVirtualDisplay) {
+             val cacheDir = File(context.cacheDir, SCREENSHOT_CACHE_DIR).apply { mkdirs() }
+             pruneOldCacheScreenshots(cacheDir)
+             captureVirtualDisplay(displayId, keep, cacheDir, context)
+@@ -251,11 +258,19 @@ private fun captureVirtualDisplay(
+             put("detail", "Virtual display has not rendered a frame yet. The display may be empty or the target app has not drawn anything. Retry after a short delay or after an interaction (tap/swipe/key).")
+         }
+ 
++    return saveCapturedBitmap(bitmap, displayId, keep, cacheDir, context, false)
++}
++
++private fun saveCapturedBitmap(bitmap: Bitmap, displayId: Int, keep: Boolean, cacheDir: File, context: Context, root: Boolean): JsonObject {
+     val ts = System.currentTimeMillis()
+     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date(ts))
+     val displayName = "Screenshot_${timestamp}_display${displayId}.png"
+ 
++    val originalWidth = bitmap.width
++    val originalHeight = bitmap.height
+     val modelBitmap = downscaleForModel(bitmap, MODEL_MAX_DIM)
++    val modelWidth = modelBitmap.width
++    val modelHeight = modelBitmap.height
+     // NOTE: keep the original bitmap alive for the gallery full-resolution copy below.
+ 
+     val pngBytes: ByteArray? = try {
+@@ -328,10 +343,29 @@ private fun captureVirtualDisplay(
+             put("note", "Transient working copy — deleted when this turn ends. Pass keep=true to save.")
+         }
+         // No screen_state for virtual displays — the a11y service only tracks the default display.
+-        put("virtual_display", true)
++        if (root) { put("backend", "root"); put("display_width", originalWidth); put("display_height", originalHeight); put("image_width", modelWidth); put("image_height", modelHeight); put("note_backend", "Coordinates must be scaled from image size to display size. Screen state is unavailable; secure surfaces may be blank.") } else put("virtual_display", true)
+     }
+ }
+ 
++private suspend fun captureRootScreenshot(context: Context, keep: Boolean): JsonObject = withContext(Dispatchers.IO) {
++    val dir = File(context.cacheDir, SCREENSHOT_CACHE_DIR).apply { mkdirs() }
++    pruneOldCacheScreenshots(dir)
++    val tmp = File.createTempFile("root-capture-", ".png", dir)
++    try {
++        val result = RootControl.execute(context, "screencap -p > ${RootControl.quote(tmp.absolutePath)}")
++        if (result["success"]?.jsonPrimitive?.booleanOrNull != true) return@withContext result
++        if (tmp.length() <= 0 || tmp.length() > 40L * 1024 * 1024) return@withContext buildJsonObject {
++            put("error", "screenshot_unavailable"); put("reason", "empty_or_oversized_capture")
++        }
++        val bitmap = BitmapFactory.decodeFile(tmp.absolutePath) ?: return@withContext buildJsonObject {
++            put("error", "screenshot_unavailable"); put("reason", "invalid_image")
++        }
++        saveCapturedBitmap(bitmap, 0, keep, dir, context, true)
++    } catch (e: Exception) {
++        buildJsonObject { put("error", "screenshot_unavailable"); put("reason", e.message ?: "capture_failed") }
++    } finally { tmp.delete() }
++}
++
+ /**
+  * Persist already-encoded [pngBytes] as a PNG into the device gallery at
+  * Pictures/RikkaHub/Screenshots/.
 diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
 index f064f2e..18c3a14 100644
 --- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/SwipeTool.kt
@@ -260,8 +483,46 @@ index bf6e565..941dd34 100644
          val payload = AccessibilityServiceHandle.withService { svc ->
              withActionEnvelope(svc) { _ ->
                  val dm = svc.resources.displayMetrics
+diff --git a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
+index a580fe9..f387ee3 100644
+--- a/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
++++ b/app/src/main/java/me/rerere/rikkahub/data/ai/tools/local/WindowTreeTool.kt
+@@ -106,9 +106,10 @@ private fun android.view.accessibility.AccessibilityWindowInfo.getDisplayIdCompa
+ fun readWindowTreeTool(
+     invocationContext: ToolInvocationContext = ToolInvocationContext.EMPTY,
+     streamer: InteractiveToolStreamer = InteractiveToolStreamer.NoOp,
++    rootContext: android.content.Context? = null,
+ ): Tool = Tool(
+     name = "read_window_tree",
+-    description = "Snapshot of the active window's a11y node tree. Default filters to visible nodes that are clickable / scrollable / editable / have text or content_description. verbose=true skips the filter (use sparingly). max_nodes caps result (default 300, max 2000). package_name optionally restricts + errors if the foreground app doesn't match. display_id captures the window tree of a virtual display (requires API 33+; pass the display_id returned by virtual_display_create). Every node carries a node_id you can pass directly to click_node / set_text (preferred over by/value or coordinates). The result includes screen_state identifying the current surface (package, shade_open, ime_visible, display size) and tree_hash. Re-reading a screen that did not move answers {unchanged:true} instead of the whole tree again — pass full=true if you really need the nodes. diff=true returns only the nodes that appeared / disappeared since your previous read: much cheaper after an action.",
++    description = "Snapshot of the active window tree. In Root mode use tap with returned center coordinates; node IDs, diff and screen_state are unavailable. Default filters to visible nodes that are clickable / scrollable / editable / have text or content_description. verbose=true skips the filter (use sparingly). max_nodes caps result (default 300, max 2000). package_name optionally restricts + errors if the foreground app doesn't match. display_id captures the window tree of a virtual display (requires API 33+; pass the display_id returned by virtual_display_create). In accessibility mode nodes carry node_id handles for click_node / set_text. Root mode returns center coordinates instead. The result includes screen_state identifying the current surface (package, shade_open, ime_visible, display size) and tree_hash. Re-reading a screen that did not move answers {unchanged:true} instead of the whole tree again — pass full=true if you really need the nodes. diff=true returns only the nodes that appeared / disappeared since your previous read: much cheaper after an action.",
+     parameters = {
+         InputSchema.Obj(
+             properties = buildJsonObject {
+@@ -140,7 +141,7 @@ fun readWindowTreeTool(
+         )
+     },
+     execute = { input ->
+-        me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
++        if (rootContext == null || !RootControl.enabled(rootContext)) me.rerere.rikkahub.service.RikkaAccessibilityService.instance?.let { wakeScreenIfNeeded(it) }
+         val verbose = input.jsonObject["verbose"]?.jsonPrimitive?.booleanOrNull ?: false
+         val maxNodesRaw = input.jsonObject["max_nodes"]?.jsonPrimitive?.intOrNull ?: DEFAULT_MAX_NODES
+         val maxNodes = maxNodesRaw.coerceIn(1, MAX_NODES_HARD_CEILING)
+@@ -149,6 +150,12 @@ fun readWindowTreeTool(
+         val diff = input.jsonObject["diff"]?.jsonPrimitive?.booleanOrNull ?: false
+         val displayId = input.jsonObject["display_id"]?.jsonPrimitive?.intOrNull ?: 0
+ 
++        if (rootContext != null && RootControl.enabled(rootContext)) {
++            if (displayId != 0) return@Tool listOf(UIMessagePart.Text(buildJsonObject { put("error", "root_display_unsupported") }.toString()))
++            val tree = rootWindowTree(rootContext, maxNodes, verbose, pkgFilter)
++            streamer.streamIfHeadless(invocationContext, "ReadWindowTree")
++            return@Tool listOf(UIMessagePart.Text(tree.toString()))
++        }
+         val payload = AccessibilityServiceHandle.withService { svc ->
+             // For non-default displays, find windows on that display via getWindows().
+             // rootInActiveWindow only returns the default display's active window.
 diff --git a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
-index 4a06cca..b99193b 100644
+index 4a06cca..9a5ea76 100644
 --- a/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
 +++ b/app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAccessibilityPage.kt
 @@ -15,6 +15,9 @@ import androidx.compose.material3.LargeFlexibleTopAppBar
@@ -313,7 +574,7 @@ index 4a06cca..b99193b 100644
 +                rootTestResult = result.toString()
 +            } }) { Text("测试 Root 授权") }
 +            if (rootTestResult.isNotEmpty()) Text(rootTestResult)
-+            Text("Root 模式支持点击、长按、滑动和部分系统按键。截图、界面节点和其他操作仍可能需要无障碍；失败不会自动切换。")
++            Text("Root 模式支持点击、长按、滑动、部分系统按键、截图和界面树读取。节点点击、文字输入等仍需要无障碍；界面树可用坐标点击。失败不会自动切换。")
              // Status card
              Text(
                  text = stringResource(R.string.setting_page_accessibility_status_section),
